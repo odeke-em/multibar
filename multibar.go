@@ -9,13 +9,15 @@ import (
 	"sync"
 	"time"
 
+	"github.com/odeke-em/goht/ordset"
 	"github.com/sethgrid/curse"
 )
 
 type progressFunc func(progress int)
 
 type BarContainer struct {
-	Bars []*ProgressBar
+	Bars     []*ProgressBar
+	ordering *ordset.OrdSet
 
 	screenLines   int
 	screenWidth   int
@@ -50,7 +52,11 @@ func New() (*BarContainer, error) {
 
 	history := make(map[int]string)
 
-	b := &BarContainer{screenWidth: width, screenLines: lines, startingLine: line, history: history}
+	b := &BarContainer{
+		ordering:    ordset.New(),
+		screenWidth: width, screenLines: lines,
+		startingLine: line, history: history,
+	}
 	// todo: need to figure out a way to deal with additional progressbars while the listener
 	// is listening. for the time being, the calling app will have to call listen after
 	// all bars are declared
@@ -83,8 +89,28 @@ func (b *BarContainer) Listen() {
 	b.Println()
 }
 
-func (b *BarContainer) MakeBar(total int, prepend string) progressFunc {
-	ch := make(chan int)
+func (b *BarContainer) RemoveBar(uid uint) (*ProgressBar, bool) {
+	b.Lock()
+	defer b.Unlock()
+
+	origLength := b.ordering.Length()
+	retr, popd := b.ordering.Remove(uid)
+	coerced, _ := retr.(*ProgressBar)
+
+	curLength := b.ordering.Length()
+	difference := origLength - curLength
+	if difference < 0 {
+		difference *= -1
+	}
+
+	if difference != 0 {
+		b.redrawAll(difference)
+	}
+
+	return coerced, popd
+}
+
+func (b *BarContainer) NewBar(total int, prepend string) *ProgressBar {
 	bar := &ProgressBar{
 		Width:           b.screenWidth - len(prepend) - 20,
 		Total:           total,
@@ -97,20 +123,46 @@ func (b *BarContainer) MakeBar(total int, prepend string) progressFunc {
 		ShowPercent:     true,
 		ShowTimeElapsed: true,
 		StartTime:       time.Now(),
-		progressChan:    ch,
+		progressChan:    make(chan int),
 	}
 
-	b.Bars = append(b.Bars, bar)
+	b.Lock()
+
+	curLength := uint(b.ordering.Length())
+	b.ordering.Add(curLength, bar)
+	reorganizedBars := []*ProgressBar{}
+
+	valuesOrderedByKeys := b.ordering.ValuesOrderedByKeys()
+	for _, val := range valuesOrderedByKeys {
+		if pb, ok := val.(*ProgressBar); ok {
+			reorganizedBars = append(reorganizedBars, pb)
+		}
+	}
+	b.Bars = reorganizedBars
+
+	b.Unlock()
+
 	bar.Line = b.startingLine + b.totalNewlines
 	b.history[bar.Line] = ""
 	bar.Update(0)
 	b.Println()
 
-	return func(progress int) { bar.progressChan <- progress }
+	return bar
 }
 
 func (p *ProgressBar) AddPrepend(str string) {
 	p.Prepend = str
+}
+
+func (p *ProgressBar) Progress(size int) {
+	p.progressChan <- size
+}
+
+func (p *ProgressBar) Progress64(size int64) {
+	chunkified := chunkInt64(size)
+	for chunk := range chunkified {
+		p.progressChan <- chunk
+	}
 }
 
 func (p *ProgressBar) Update(progress int) {
@@ -245,4 +297,14 @@ func countAllNewlines(interfaces ...interface{}) int {
 		}
 	}
 	return count
+}
+
+// resetLines erases the print output and resets the cursor to the pre-print line
+func ResetLines(n int) {
+	c := &curse.Cursor{}
+	for i := 0; i < n; i++ {
+		c.EraseCurrentLine()
+		c.MoveUp(1)
+	}
+	c.EraseCurrentLine()
 }
